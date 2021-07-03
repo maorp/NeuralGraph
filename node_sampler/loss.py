@@ -283,6 +283,55 @@ class SurfaceConsistencyLoss(nn.Module):
     def __init__(self):
         super(SurfaceConsistencyLoss, self).__init__()
 
+    @staticmethod
+    def transform_cloud(constants, scales, rotations, centers, surface_samples, source_idx, target_idx):
+        batch_size = constants.shape[0]
+        num_points = surface_samples.shape[0]
+        surface_points = torch.from_numpy(surface_samples).cuda() #surface_samples[:, :, :3]
+        surface_points = torch.unsqueeze(surface_points, 0)
+        surface_points_cat = torch.cat(batch_size*[surface_points])
+
+        # Compute skinning weights for sampled points.
+        skinning_weights = sample_rbf_weights(surface_points_cat, constants, scales, centers,
+                                              cfg.use_constants)  # (bs, num_points, num_nodes)
+
+        # Get source points.
+        #source_points = surface_points[source_idx]  # (num_points, 3)
+        source_points = surface_points
+
+        # Get source and target rotations.
+        R_source = rotations[source_idx]  # (num_nodes, 3, 3)
+        R_target = rotations[target_idx]  # (num_nodes, 3, 3)
+
+        # Compute relative frame-to-frame rotation and translation estimates.
+        t_source = centers[source_idx]
+        t_target = centers[target_idx]
+
+        R_source_inv = R_source.permute(0, 2, 1)
+        R_rel = torch.matmul(R_target, R_source_inv)  # (num_nodes, 3, 3)
+
+        # Get corresponding skinning weights and normalize them to sum up to 1.
+        weights = skinning_weights[source_idx].view(num_points, cfg.num_nodes)
+        weights_sum = weights.sum(dim=1, keepdim=True)
+        weights = weights.div(weights_sum)
+
+        # Apply deformation to sampled points.
+        t_source = t_source.view(1, cfg.num_nodes, 3, 1).expand(num_points, -1, -1,
+                                                                    -1)  # (num_points, num_nodes, 3, 1)
+        t_target = t_target.view(1, cfg.num_nodes, 3, 1).expand(num_points, -1, -1,
+                                                                    -1)  # (num_points, num_nodes, 3, 1)
+        R_rel = R_rel.view(1, cfg.num_nodes, 3, 3).expand(num_points, -1, -1, -1)  # (num_points, num_nodes, 3, 3)
+        source_points = source_points.view(num_points, 1, 3, 1).expand(-1, cfg.num_nodes, -1,
+                                                                           -1)  # (num_points, num_nodes, 3, 1)
+        weights = weights.view(num_points, cfg.num_nodes, 1, 1).expand(-1, -1, 3,
+                                                                           -1)  # (num_points, num_nodes, 3, 1)
+
+        transformed_points = torch.matmul(R_rel,
+                                              (source_points - t_source)) + t_target  # (num_points, num_nodes, 3, 1)
+        transformed_points = torch.sum(weights * transformed_points, dim=1).view(num_points, 3)
+
+        return transformed_points
+
     def forward(self, constants, scales, rotations, centers, surface_samples, grid, world2grid):
         batch_size = constants.shape[0]
         num_points = surface_samples.shape[1]
